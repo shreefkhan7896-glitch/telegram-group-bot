@@ -231,7 +231,6 @@ async def show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE, group: 
 
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     args = context.args or []
     group = None
     if args and args[0].startswith("g") and args[0][1:].isdigit():
@@ -240,19 +239,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["join_group_id"] = group["id"]
         return await show_plans(update, context, group)
 
-    owned = []
-    try:
-        owned = (
-            sb.table("groups").select("id").eq("owner_user_id", user.id).limit(1).execute().data
-            or []
-        )
-    except Exception:
-        pass
-    hint = "\n\nTum admin ho? Dashboard ke liye /admin likho." if owned else ""
-    await update.message.reply_text(
-        "Welcome! Main paid Telegram groups manage karne wala bot hoon.\n"
-        "Kisi group me join karna hai to admin ka diya hua join link use karo." + hint
-    )
+    # Bina join link ke /start par sirf "Welcome"
+    await update.message.reply_text("Welcome")
     return ConversationHandler.END
 
 
@@ -989,9 +977,8 @@ async def followup_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=lead["user_id"],
                 text=(
-                    f"Salam {lead.get('full_name') or ''}! Tumne {group['title']} ka plan dekha tha "
-                    "lekin join complete nahi hua.\n\nKoi sawal hai to admin se puch lo, ya neeche "
-                    "button se plan select karke payment kar do. Seats limited hote hain."
+                    "Reminder: Aapne abhi tak group join karne ka process poora nahi kiya hai. "
+                    "Kripya apna payment poora karein."
                 ),
                 reply_markup=markup,
             )
