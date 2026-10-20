@@ -209,7 +209,10 @@ async def reconcile_group_access(bot, group: dict, *, notify_owner: bool = True)
         return "error"
 
     if bot_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        was_active = group_is_active(group)
         changed = set_group_lifecycle(group, active=True)
+        if not was_active and not changed:
+            return "error"
         if changed and notify_owner and group.get("owner_user_id"):
             try:
                 await bot.send_message(
