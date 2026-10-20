@@ -53,6 +53,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=os.getenv("LOG_LEVEL", "INFO"),
 )
+# httpx logs full Telegram API request URLs at INFO level, including the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("groupbot")
 
 # --------------------------------------------------------------------------
