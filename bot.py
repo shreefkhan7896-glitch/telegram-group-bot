@@ -35,6 +35,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatMemberStatus
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -147,6 +148,116 @@ def get_group_by_chat(chat_id: int):
 
 def group_is_active(group: dict | None) -> bool:
     return bool(group and group.get("is_active", True))
+
+
+def set_group_lifecycle(group: dict, *, active: bool, reason: str | None = None) -> bool:
+    """Soft-disable inaccessible groups while retaining billing/member history."""
+    was_active = group_is_active(group)
+    if was_active == active:
+        return False
+    try:
+        sb.table("groups").update(
+            {"is_active": active}
+        ).eq("id", group["id"]).execute()
+        group["is_active"] = active
+        logger.info(
+            "group lifecycle changed group_id=%s active=%s reason=%s",
+            group["id"],
+            active,
+            reason,
+        )
+        return True
+    except Exception:
+        logger.exception("group lifecycle update failed for group_id=%s", group.get("id"))
+        return False
+
+
+async def reconcile_group_access(bot, group: dict, *, notify_owner: bool = True) -> str:
+    """Check Telegram's live membership state and hide groups the bot cannot manage."""
+    try:
+        bot_member = await bot.get_chat_member(group["chat_id"], bot.id)
+    except (BadRequest, Forbidden) as exc:
+        changed = set_group_lifecycle(
+            group, active=False, reason="telegram_chat_unavailable"
+        )
+        logger.info(
+            "group unavailable to bot group_id=%s error_type=%s",
+            group.get("id"),
+            type(exc).__name__,
+        )
+        if changed and notify_owner and group.get("owner_user_id"):
+            try:
+                await bot.send_message(
+                    group["owner_user_id"],
+                    f"{group.get('title') or 'A group'} dashboard se hide kar diya hai kyunki "
+                    "bot ab us group ko access nahi kar sakta. Bot ko dobara admin banao "
+                    "ya group delete ho gaya ho to koi action zaroori nahi.",
+                )
+            except TelegramError:
+                logger.info("could not notify owner for inactive group_id=%s", group.get("id"))
+        return "inactive"
+    except TelegramError as exc:
+        # Network/API outages are not evidence that a group was deleted.
+        logger.warning(
+            "group access check temporarily failed group_id=%s error_type=%s",
+            group.get("id"),
+            type(exc).__name__,
+        )
+        return "error"
+    except Exception:
+        logger.exception("unexpected group access check failure group_id=%s", group.get("id"))
+        return "error"
+
+    if bot_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+        changed = set_group_lifecycle(group, active=True)
+        if changed and notify_owner and group.get("owner_user_id"):
+            try:
+                await bot.send_message(
+                    group["owner_user_id"],
+                    f"{group.get('title') or 'Group'} bot dashboard me wapas active hai.",
+                )
+            except TelegramError:
+                logger.info("could not notify owner for reactivated group_id=%s", group.get("id"))
+        return "active"
+
+    changed = set_group_lifecycle(group, active=False, reason="bot_not_admin")
+    if changed and notify_owner and group.get("owner_user_id"):
+        try:
+            await bot.send_message(
+                group["owner_user_id"],
+                f"{group.get('title') or 'A group'} dashboard se hide kar diya hai kyunki "
+                "bot ab admin nahi hai. Gatekeeper chalane ke liye bot ko dobara admin banao "
+                "aur /setup chalao.",
+            )
+        except TelegramError:
+            logger.info("could not notify owner for non-admin group_id=%s", group.get("id"))
+    return "inactive"
+
+
+def get_owned_groups(user_id: int) -> list[dict]:
+    try:
+        return (
+            sb.table("groups")
+            .select("id,title,chat_id,owner_user_id,is_active")
+            .eq("owner_user_id", user_id)
+            .order("id")
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        logger.exception("owned groups query failed for user_id=%s", user_id)
+        return []
+
+
+async def get_live_owned_groups(user_id: int, bot) -> list[dict]:
+    groups = get_owned_groups(user_id)
+    active = []
+    for group in groups:
+        state = await reconcile_group_access(bot, group)
+        if state == "active" or (state == "error" and group_is_active(group)):
+            active.append(group)
+    return active
 
 
 def get_member(group_id: int, user_id: int):
@@ -346,7 +457,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["join_group_id"] = group["id"]
         return await show_plans(update, context, group)
 
-    # Bina join link ke /start par sirf "Welcome"
+    # Owners who open the bot directly get a live-checked group list.
+    if get_owned_groups(update.effective_user.id):
+        return await show_group_list(
+            update.message, update.effective_user.id, context.bot
+        )
+
+    # Members who open the bot without a group join link get a simple greeting.
     await update.message.reply_text("Welcome")
     return ConversationHandler.END
 
@@ -1043,11 +1160,17 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     existing = get_group_by_chat(chat.id)
-    if existing:
+    if existing and group_is_active(existing):
         await update.message.reply_text(
             f"Ye group pehle se registered hai: {existing['title']}\n"
             f"Members ke liye join link:\nhttps://t.me/{context.bot.username}?start=g{existing['id']}\n\n"
             "Settings ke liye bot ko DM me /admin likho."
+        )
+        return
+    if existing and existing.get("owner_user_id") != user.id:
+        await update.message.reply_text(
+            "Ye group kisi aur admin account se register hua tha. Purane registered owner "
+            "ko /setup chalane ko kaho; ownership transfer ke liye platform support se rabta karo."
         )
         return
 
@@ -1060,17 +1183,32 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        res = sb.table("groups").insert(
-            {
-                "chat_id": chat.id,
-                "title": chat.title or "",
-                "owner_user_id": user.id,
-                "gatekeeper_enabled": True,
-                "anti_spam_enabled": True,
-                "flood_control_enabled": True,
-            }
-        ).execute()
-        gid = res.data[0]["id"]
+        if existing:
+            res = (
+                sb.table("groups")
+                .update(
+                    {
+                        "title": chat.title or existing.get("title") or "",
+                        "is_active": True,
+                    }
+                )
+                .eq("id", existing["id"])
+                .execute()
+            )
+            gid = existing["id"]
+        else:
+            res = sb.table("groups").insert(
+                {
+                    "chat_id": chat.id,
+                    "title": chat.title or "",
+                    "owner_user_id": user.id,
+                    "gatekeeper_enabled": True,
+                    "anti_spam_enabled": True,
+                    "flood_control_enabled": True,
+                    "is_active": True,
+                }
+            ).execute()
+            gid = res.data[0]["id"]
     except Exception:
         logger.exception("group insert failed")
         await update.message.reply_text("Registration me masla aaya, dobara try karo.")
@@ -1081,10 +1219,10 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error("Admin trial could not be initialized for user %s", user.id)
 
     await update.message.reply_text(
-        f"Group registered ho gaya: {chat.title}\n\n"
+        f"{'Purana group wapas active ho gaya' if existing else 'Group registered ho gaya'}: {chat.title}\n\n"
         f"Members ke liye join link:\nhttps://t.me/{context.bot.username}?start=g{gid}\n\n"
         "Ab bot ko DM me /dashboard likh kar UPI ID/QR, plans, welcome, FAQ aur moderation set karo. "
-        "Tumhara 7-day free trial ab shuru ho gaya hai."
+        f"{'Purani group settings aur member history preserve hain.' if existing else 'Tumhara 7-day free trial ab shuru ho gaya hai.'}"
     )
 
 
@@ -1137,17 +1275,12 @@ def dashboard_markup(group: dict) -> InlineKeyboardMarkup:
     )
 
 
-async def show_group_list(message_or_query, user_id: int):
-    try:
-        groups = (
-            sb.table("groups").select("id,title,chat_id").eq("owner_user_id", user_id).execute().data
-            or []
-        )
-    except Exception:
-        groups = []
+async def show_group_list(message_or_query, user_id: int, bot, groups=None):
+    if groups is None:
+        groups = await get_live_owned_groups(user_id, bot)
     if not groups:
         text = (
-            "Tumhara koi group registered nahi hai.\n\n"
+            "Tumhara koi active group registered nahi hai.\n\n"
             "Steps:\n1) Bot ko Supergroup me add karke admin banao (Restrict members, Delete messages, Invite users).\n"
             "2) Group ke andar /setup likho.\n3) Phir yahan /dashboard se settings karo."
         )
@@ -1160,7 +1293,7 @@ async def show_group_list(message_or_query, user_id: int):
         [InlineKeyboardButton(g["title"] or f"Group {g['id']}", callback_data=f"adm:grp:{g['id']}")]
         for g in groups
     ]
-    text = "Apna group select karo:"
+    text = "Apna active group select karo. Live check ke liye /cleanup likho:"
     markup = InlineKeyboardMarkup(buttons)
     if hasattr(message_or_query, "data"):  # CallbackQuery
         await message_or_query.edit_message_text(text, reply_markup=markup)
@@ -1170,20 +1303,13 @@ async def show_group_list(message_or_query, user_id: int):
 
 
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        owned_groups = (
-            sb.table("groups")
-            .select("id")
-            .eq("owner_user_id", update.effective_user.id)
-            .limit(1)
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        owned_groups = []
+    owned_groups = await get_live_owned_groups(
+        update.effective_user.id, context.bot
+    )
     if not owned_groups:
-        return await show_group_list(update.message, update.effective_user.id)
+        return await show_group_list(
+            update.message, update.effective_user.id, context.bot, groups=[]
+        )
     access, status, until = admin_account_access(update.effective_user.id)
     if not access:
         account = get_admin_account(update.effective_user.id)
@@ -1200,7 +1326,9 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
         )
         return ConversationHandler.END
-    return await show_group_list(update.message, update.effective_user.id)
+    return await show_group_list(
+        update.message, update.effective_user.id, context.bot, groups=owned_groups
+    )
 
 
 async def show_dashboard(query, group: dict):
@@ -1249,13 +1377,19 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if action == "back":
-        return await show_group_list(query, query.from_user.id)
+        return await show_group_list(query, query.from_user.id, context.bot)
 
     group_id = int(parts[2])
     group = get_group_by_id(group_id)
     if not group or group["owner_user_id"] != query.from_user.id:
         await safe_answer(query, "Ye group tumhara nahi hai.", alert=True)
         return A_NAV
+    live_state = await reconcile_group_access(context.bot, group)
+    if live_state == "inactive" or (live_state == "error" and not group_is_active(group)):
+        await query.edit_message_text(
+            "Ye group ab active nahi hai. Bot ko group me admin bana kar /setup chalao."
+        )
+        return ConversationHandler.END
     context.user_data["adm_group_id"] = group_id
 
     if action == "billing":
@@ -1782,6 +1916,45 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await gate_member(context, group, new.user)
 
 
+async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately deactivate/reactivate a registered group when bot rights change."""
+    member_update = update.my_chat_member
+    if not member_update or member_update.chat.type not in ("group", "supergroup"):
+        return
+    group = get_group_by_chat(member_update.chat.id)
+    if not group:
+        return
+
+    new_status = member_update.new_chat_member.status
+    bot_is_admin = new_status in (
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    )
+    reason = None if bot_is_admin else (
+        "bot_removed" if new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        else "bot_not_admin"
+    )
+    changed = set_group_lifecycle(group, active=bot_is_admin, reason=reason)
+    if not changed or not group.get("owner_user_id"):
+        return
+
+    if bot_is_admin:
+        text = (
+            f"{group.get('title') or 'Group'} dashboard wapas active hai. "
+            "Settings kholne ke liye /admin use karo."
+        )
+    else:
+        text = (
+            f"{group.get('title') or 'Group'} dashboard inactive kar diya hai kyunki bot "
+            "group se remove ho gaya hai ya admin nahi raha. Bot ko admin bana kar "
+            "dobara /setup chalao."
+        )
+    try:
+        await context.bot.send_message(group["owner_user_id"], text)
+    except TelegramError:
+        logger.info("could not send membership-change notice group_id=%s", group.get("id"))
+
+
 async def delete_service_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_message.delete()
@@ -1789,9 +1962,63 @@ async def delete_service_msg(update: Update, context: ContextTypes.DEFAULT_TYPE)
         pass
 
 
+async def cleanup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-triggered live reconciliation for all registered groups."""
+    user_id = update.effective_user.id
+    groups = get_owned_groups(user_id)
+    if not groups:
+        await update.message.reply_text("Tumhare account par koi registered group nahi mila.")
+        return
+
+    active = inactive = errors = 0
+    for group in groups:
+        result = await reconcile_group_access(context.bot, group)
+        if result == "active":
+            active += 1
+        elif result == "inactive":
+            inactive += 1
+        else:
+            errors += 1
+    await update.message.reply_text(
+        "Group cleanup complete.\n"
+        f"Active: {active}\nInactive/hidden: {inactive}\n"
+        f"Temporary API checks skipped: {errors}"
+    )
+
+
 # --------------------------------------------------------------------------
 # BACKGROUND JOBS: abandoned-cart follow-up + expiry/renewal engine
 # --------------------------------------------------------------------------
+async def group_reconcile_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodically hide groups removed while the bot was offline."""
+    last_id = 0
+    while True:
+        try:
+            groups = (
+                sb.table("groups")
+                .select("id,title,chat_id,owner_user_id,is_active")
+                .eq("is_active", True)
+                .gt("id", last_id)
+                .order("id")
+                .limit(100)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            logger.exception("group reconciliation query failed")
+            return
+        if not groups:
+            return
+
+        for group in groups:
+            last_id = max(last_id, int(group["id"]))
+            await reconcile_group_access(context.bot, group)
+            await asyncio.sleep(0.05)
+        if len(groups) < 100:
+            return
+
+
 async def followup_job(context: ContextTypes.DEFAULT_TYPE):
     cutoff = (now_utc() - timedelta(hours=2)).isoformat()
     try:
@@ -2006,9 +2233,13 @@ def main():
     app.add_handler(CallbackQueryHandler(pay_decision, pattern=r"^(payapp|payrej):\d+$"))
     app.add_handler(CallbackQueryHandler(saas_payment_decision, pattern=r"^saas(app|rej):\d+$"))
     app.add_handler(CommandHandler("superadmin", superadmin_pending, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("cleanup", cleanup_cmd, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setup", setup_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
     app.add_handler(ChatMemberHandler(chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(
+        ChatMemberHandler(bot_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
 
     # Group moderation (status updates pehle, phir aam messages)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_member), group=0)
@@ -2024,6 +2255,9 @@ def main():
     # Background jobs
     app.job_queue.run_repeating(followup_job, interval=900, first=60, name="followup")
     app.job_queue.run_repeating(expiry_job, interval=900, first=120, name="expiry")
+    app.job_queue.run_repeating(
+        group_reconcile_job, interval=6 * 60 * 60, first=300, name="group_reconcile"
+    )
 
     app.add_error_handler(error_handler)
     logger.info("Bot start ho raha hai...")
