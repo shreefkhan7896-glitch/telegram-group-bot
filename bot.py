@@ -16,6 +16,8 @@ bot kabhi paisa touch nahi karta (zero commission model).
 Render par Web Service ke liye chhota health server bhi chalta hai (PORT env).
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
@@ -36,6 +38,7 @@ from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ChatJoinRequestHandler,
     CommandHandler,
     ContextTypes,
@@ -74,10 +77,24 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Conversation states
 WAIT_PLAN, WAIT_SCREENSHOT, WAIT_UTR = range(3)
 A_NAV, A_UPI, A_QR, A_PLAN_PRICE, A_BCAST = range(10, 15)
+BILLING_SCREENSHOT, BILLING_UTR = range(20, 22)
+A_WELCOME, A_FAQ = range(30, 32)
+
+SUPER_ADMIN_IDS = {
+    int(value.strip())
+    for value in os.getenv("SUPER_ADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+PLATFORM_UPI_ID = os.getenv("PLATFORM_UPI_ID", "").strip()
+SAAS_MONTHLY_PRICE = int(os.getenv("SAAS_MONTHLY_PRICE", "299"))
+SAAS_BILLING_DAYS = int(os.getenv("SAAS_BILLING_DAYS", "30"))
+PLATFORM_QR_FILE_ID = os.getenv("PLATFORM_QR_FILE_ID", "").strip()
+LINK_RE = re.compile(r"(?:https?://|www\.|t\.me/|telegram\.me/|(?<!\w)@[A-Za-z0-9_]{5,})", re.I)
 
 # Flood control + group admin cache (in-memory, MVP ke liye kaafi hai)
 _flood: dict[tuple[int, int], list[float]] = {}
 _admin_cache: dict[int, tuple[float, set[int]]] = {}
+_join_seen: dict[tuple[int, int], float] = {}
 
 
 # --------------------------------------------------------------------------
@@ -125,6 +142,10 @@ def get_group_by_chat(chat_id: int):
         return None
 
 
+def group_is_active(group: dict | None) -> bool:
+    return bool(group and group.get("is_active", True))
+
+
 def get_member(group_id: int, user_id: int):
     try:
         res = (
@@ -139,6 +160,75 @@ def get_member(group_id: int, user_id: int):
     except Exception:
         logger.exception("get_member failed")
         return None
+
+
+def member_is_active(group_id: int, user_id: int) -> bool:
+    member = get_member(group_id, user_id)
+    if not member or member.get("status") != "ACTIVE":
+        return False
+    expiry = parse_dt(member.get("expiry_date"))
+    return bool(expiry and expiry > now_utc())
+
+
+def get_admin_account(user_id: int, *, create: bool = True):
+    try:
+        res = (
+            sb.table("admin_accounts")
+            .select("*")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        if res.data:
+            return res.data
+        if not create:
+            return None
+        started = now_utc()
+        try:
+            sb.table("admin_accounts").insert(
+                {
+                    "user_id": user_id,
+                    "trial_started_at": started.isoformat(),
+                    "trial_ends_at": (started + timedelta(days=7)).isoformat(),
+                    "subscription_status": "TRIAL",
+                }
+            ).execute()
+        except Exception:
+            # Another update may have initialized the row at the same time.
+            pass
+        res = (
+            sb.table("admin_accounts")
+            .select("*")
+            .eq("user_id", user_id)
+            .maybe_single()
+            .execute()
+        )
+        return res.data
+    except Exception:
+        logger.exception("get_admin_account failed; schema migration may be missing")
+        return None
+
+
+def admin_account_access(
+    user_id: int, *, create: bool = True
+) -> tuple[bool, str, datetime | None]:
+    account = get_admin_account(user_id, create=create)
+    if not account:
+        return False, "UNAVAILABLE", None
+    # Keep existing groups operational until the platform has configured a
+    # payment destination and at least one reviewer; trial enforcement starts
+    # automatically as soon as SaaS billing can actually accept payments.
+    if not SUPER_ADMIN_IDS or not PLATFORM_UPI_ID:
+        return True, "BILLING_SETUP_REQUIRED", None
+    now = now_utc()
+    status = account.get("subscription_status")
+    paid_until = parse_dt(account.get("paid_until"))
+    trial_ends = parse_dt(account.get("trial_ends_at"))
+    if status == "ACTIVE" and paid_until and paid_until > now:
+        return True, "ACTIVE", paid_until
+    if status == "TRIAL" and trial_ends and trial_ends > now:
+        return True, "TRIAL", trial_ends
+    return False, "LOCKED", trial_ends or paid_until
 
 
 def get_plans(group: dict) -> dict:
@@ -241,6 +331,15 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if args and args[0].startswith("g") and args[0][1:].isdigit():
         group = get_group_by_id(int(args[0][1:]))
     if group:
+        if not group_is_active(group):
+            await update.message.reply_text("Ye group filhaal bot par active nahi hai. Admin se rabta karo.")
+            return ConversationHandler.END
+        owner_access, _, _ = admin_account_access(group["owner_user_id"], create=False)
+        if not owner_access:
+            await update.message.reply_text(
+                f"{group['title']} ka subscription process filhaal paused hai. Group owner se rabta karo."
+            )
+            return ConversationHandler.END
         context.user_data["join_group_id"] = group["id"]
         return await show_plans(update, context, group)
 
@@ -255,8 +354,12 @@ async def renew_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(query)
     group_id = int(query.data.split(":")[1])
     group = get_group_by_id(group_id)
-    if not group:
+    if not group_is_active(group):
         await query.message.reply_text("Ye group ab active nahi hai. Admin se rabta karo.")
+        return ConversationHandler.END
+    owner_access, _, _ = admin_account_access(group["owner_user_id"], create=False)
+    if not owner_access:
+        await query.message.reply_text("Group owner ka SaaS plan paused hai. Owner se rabta karo.")
         return ConversationHandler.END
     context.user_data["join_group_id"] = group_id
     return await show_plans(update, context, group)
@@ -268,8 +371,12 @@ async def plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, group_id_s, label = query.data.split(":")
     group_id = int(group_id_s)
     group = get_group_by_id(group_id)
-    if not group:
+    if not group_is_active(group):
         await query.message.reply_text("Group nahi mila. Admin se rabta karo.")
+        return ConversationHandler.END
+    owner_access, _, _ = admin_account_access(group["owner_user_id"], create=False)
+    if not owner_access:
+        await query.message.reply_text("Group owner ka SaaS plan paused hai. Owner se rabta karo.")
         return ConversationHandler.END
 
     plans = get_plans(group)
@@ -324,8 +431,12 @@ async def utr_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = context.user_data.get("pay_plan")
     amount = context.user_data.get("pay_amount")
     group = get_group_by_id(group_id) if group_id else None
-    if not group:
+    if not group_is_active(group):
         await update.message.reply_text("Session expire ho gaya. Join link se dobara /start karo.")
+        return ConversationHandler.END
+    owner_access, _, _ = admin_account_access(group["owner_user_id"], create=False)
+    if not owner_access:
+        await update.message.reply_text("Group owner ka SaaS plan paused hai. Owner se rabta karo.")
         return ConversationHandler.END
 
     # Anti-fraud: UTR pehle use ho chuka hai?
@@ -366,8 +477,8 @@ async def utr_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("Approve", callback_data=f"payapp:{payment_id}"),
-                InlineKeyboardButton("Reject", callback_data=f"payrej:{payment_id}"),
+                InlineKeyboardButton("✅ Approve", callback_data=f"payapp:{payment_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"payrej:{payment_id}"),
             ]
         ]
     )
@@ -378,15 +489,13 @@ async def utr_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"UTR: {utr}\n"
         "Screenshot check karke Approve/Reject karo."
     )
-    try:
-        await context.bot.send_photo(
-            chat_id=group["owner_user_id"],
-            photo=context.user_data.get("screenshot_file_id"),
-            caption=caption,
-            reply_markup=buttons,
-        )
-    except Exception:
-        logger.exception("owner notify failed")
+    await notify_group_admins(
+        context,
+        group,
+        photo=context.user_data.get("screenshot_file_id"),
+        caption=caption,
+        reply_markup=buttons,
+    )
 
     await update.message.reply_text(
         "Payment admin ko bhej di gayi hai. Approve hote hi tumhe private join link "
@@ -418,7 +527,10 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     group = get_group_by_id(payment["group_id"])
-    if not group or group["owner_user_id"] != query.from_user.id:
+    if not group or (
+        group["owner_user_id"] != query.from_user.id
+        and query.from_user.id not in await get_admin_ids(context, group["chat_id"])
+    ):
         await safe_answer(query, "Sirf group admin hi approve/reject kar sakta hai.", alert=True)
         return
     if payment["status"] != "PENDING":
@@ -427,9 +539,14 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     member_id = payment["user_id"]
     if action == "payrej":
-        sb.table("payments").update(
-            {"status": "REJECTED", "reviewed_by": query.from_user.id, "reviewed_at": now_utc().isoformat()}
-        ).eq("id", payment_id).execute()
+        try:
+            sb.table("payments").update(
+                {"status": "REJECTED", "reviewed_by": query.from_user.id, "reviewed_at": now_utc().isoformat()}
+            ).eq("id", payment_id).eq("status", "PENDING").execute()
+        except Exception:
+            logger.exception("payment rejection update failed")
+            await safe_answer(query, "Database error. Dobara try karo.", alert=True)
+            return
         await safe_answer(query, "Reject kar diya.")
         try:
             await query.edit_message_caption(
@@ -460,24 +577,44 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
             base = old_expiry  # renewal: purani expiry se aage badhao
     expiry = base + timedelta(days=days)
 
-    sb.table("payments").update(
-        {"status": "APPROVED", "reviewed_by": query.from_user.id, "reviewed_at": now_utc().isoformat()}
-    ).eq("id", payment_id).execute()
-
-    sb.table("members").upsert(
-        {
-            "group_id": group["id"],
-            "user_id": member_id,
-            "username": payment.get("username"),
-            "full_name": payment.get("full_name"),
-            "plan_label": payment["plan_label"],
-            "expiry_date": expiry.isoformat(),
-            "status": "ACTIVE",
-            "reminder_2d_sent": False,
-            "reminder_1d_sent": False,
-        },
-        on_conflict="group_id,user_id",
-    ).execute()
+    try:
+        claimed = (
+            sb.table("payments")
+            .update(
+                {"status": "APPROVED", "reviewed_by": query.from_user.id, "reviewed_at": now_utc().isoformat()}
+            )
+            .eq("id", payment_id)
+            .eq("status", "PENDING")
+            .select("id")
+            .execute()
+        )
+        if not claimed.data:
+            await safe_answer(query, "Ye payment kisi aur admin ne abhi review kar di.", alert=True)
+            return
+        sb.table("members").upsert(
+            {
+                "group_id": group["id"],
+                "user_id": member_id,
+                "username": payment.get("username"),
+                "full_name": payment.get("full_name"),
+                "plan_label": payment["plan_label"],
+                "expiry_date": expiry.isoformat(),
+                "status": "ACTIVE",
+                "reminder_2d_sent": False,
+                "reminder_1d_sent": False,
+            },
+            on_conflict="group_id,user_id",
+        ).execute()
+    except Exception:
+        logger.exception("payment approval persistence failed")
+        try:
+            sb.table("payments").update(
+                {"status": "PENDING", "reviewed_by": None, "reviewed_at": None}
+            ).eq("id", payment_id).eq("status", "APPROVED").execute()
+        except Exception:
+            logger.exception("failed to restore payment after approval error")
+        await safe_answer(query, "Database error; payment approval nahi hui.", alert=True)
+        return
 
     try:
         sb.table("pending_leads").update(
@@ -486,18 +623,22 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # ID-locked join link: join request sirf usi user ke liye approve hoga
+    # If they joined before paying, remove the gate immediately after approval.
+    already_in_group = await unrestrict_if_joined(context, group["chat_id"], member_id)
+
+    # ID-locked join link: join request sirf usi user ke liye approve hoga.
     link_text = ""
-    try:
-        link = await context.bot.create_chat_invite_link(
-            chat_id=group["chat_id"],
-            name=f"paid-{member_id}"[:32],
-            expire_date=now_utc() + timedelta(hours=24),
-            creates_join_request=True,
-        )
-        link_text = link.invite_link
-    except Exception:
-        logger.exception("invite link create failed")
+    if not already_in_group:
+        try:
+            link = await context.bot.create_chat_invite_link(
+                chat_id=group["chat_id"],
+                name=f"paid-{member_id}"[:32],
+                expire_date=now_utc() + timedelta(hours=24),
+                creates_join_request=True,
+            )
+            link_text = link.invite_link
+        except Exception:
+            logger.exception("invite link create failed")
 
     await safe_answer(query, "Approve ho gaya, member ko link bhej diya.")
     try:
@@ -511,7 +652,9 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Payment approve ho gayi! {group['title']} me tumhara swagat hai.\n"
         f"Membership expiry: {fmt_ist(expiry)}\n\n"
     )
-    if link_text:
+    if already_in_group:
+        msg += "Tum group me pehle se ho; ab restrictions hata di gayi hain."
+    elif link_text:
         msg += (
             f"Join link (sirf tumhare liye, 24 ghante valid):\n{link_text}\n\n"
             "Link dabao aur 'Join Request' bhejo, bot tumhe auto-approve kar dega. "
@@ -525,17 +668,314 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("member approve DM failed")
 
 
+async def notify_group_admins(context, group, *, photo, caption, reply_markup):
+    """Send private payment review buttons to all group admins who started the bot."""
+    admin_ids = await get_admin_ids(context, group["chat_id"])
+    reviewer_ids = admin_ids | {group["owner_user_id"]}
+    sent = 0
+    for admin_id in reviewer_ids:
+        try:
+            await context.bot.send_photo(
+                chat_id=admin_id,
+                photo=photo,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+            sent += 1
+        except Exception:
+            logger.info("Unable to DM payment review to admin %s", admin_id)
+    if not sent:
+        logger.warning("No group admin could be reached for payment review (%s)", group["id"])
+
+
+async def unrestrict_if_joined(context, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, user_id)
+        if member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions.all_permissions(),
+                use_independent_chat_permissions=True,
+            )
+            return True
+        return member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        logger.info("Member is not currently present/unrestrictable in chat %s", chat_id)
+        return False
+
+
+async def billing_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await safe_answer(query)
+        reply = query.message.reply_text
+    else:
+        reply = update.message.reply_text
+    if not PLATFORM_UPI_ID or not SUPER_ADMIN_IDS:
+        await reply(
+            "Platform SaaS billing abhi configure nahi hui. Platform admin ko "
+            "SUPER_ADMIN_IDS aur PLATFORM_UPI_ID set karne honge."
+        )
+        return ConversationHandler.END
+
+    account = get_admin_account(update.effective_user.id, create=False)
+    if not account:
+        await reply("Billing database ready nahi hai. Platform admin se rabta karo.")
+        return ConversationHandler.END
+    context.user_data["saas_amount"] = SAAS_MONTHLY_PRICE
+    text = (
+        f"SecuredGroup SaaS plan: Rs {SAAS_MONTHLY_PRICE} / {SAAS_BILLING_DAYS} din\n\n"
+        f"Platform UPI par payment karo: {PLATFORM_UPI_ID}\n\n"
+        "Payment ke baad screenshot bhejo, phir 12-digit UTR submit karo. "
+        "Super-admin verify karke dashboard unlock karega."
+    )
+    if PLATFORM_QR_FILE_ID:
+        await context.bot.send_photo(
+            chat_id=update.effective_user.id,
+            photo=PLATFORM_QR_FILE_ID,
+            caption=text,
+        )
+    else:
+        await reply(text)
+    await context.bot.send_message(chat_id=update.effective_user.id, text="Ab payment screenshot bhejo:")
+    return BILLING_SCREENSHOT
+
+
+async def billing_screenshot_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["saas_screenshot_file_id"] = update.message.photo[-1].file_id
+    await update.message.reply_text("Screenshot mil gaya. Ab 12-digit UTR number bhejo:")
+    return BILLING_UTR
+
+
+async def billing_utr_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    utr = (update.message.text or "").strip()
+    if not UTR_RE.fullmatch(utr):
+        await update.message.reply_text("UTR exactly 12 digits ka hona chahiye. Dobara bhejo:")
+        return BILLING_UTR
+    user = update.effective_user
+    try:
+        duplicate = (
+            sb.table("saas_payments")
+            .select("id")
+            .eq("utr_number", utr)
+            .maybe_single()
+            .execute()
+        )
+        if duplicate.data:
+            await update.message.reply_text("Ye UTR pehle submit ho chuka hai. Naya UTR bhejo:")
+            return BILLING_UTR
+        res = sb.table("saas_payments").insert(
+            {
+                "user_id": user.id,
+                "amount": context.user_data.get("saas_amount", SAAS_MONTHLY_PRICE),
+                "billing_days": SAAS_BILLING_DAYS,
+                "utr_number": utr,
+                "screenshot_file_id": context.user_data.get("saas_screenshot_file_id"),
+                "status": "PENDING",
+            }
+        ).execute()
+        payment_id = res.data[0]["id"]
+    except Exception:
+        logger.exception("SaaS payment insert failed")
+        await update.message.reply_text("Payment request save nahi hui. Thodi der baad dobara try karo.")
+        return ConversationHandler.END
+
+    buttons = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Approve", callback_data=f"saasapp:{payment_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"saasrej:{payment_id}"),
+        ]]
+    )
+    caption = (
+        f"SaaS subscription payment\nAdmin: {user.full_name} (@{user.username or '-'})\n"
+        f"User ID: {user.id}\nAmount: Rs {SAAS_MONTHLY_PRICE}\nUTR: {utr}"
+    )
+    sent = 0
+    for super_admin_id in SUPER_ADMIN_IDS:
+        try:
+            await context.bot.send_photo(
+                chat_id=super_admin_id,
+                photo=context.user_data.get("saas_screenshot_file_id"),
+                caption=caption,
+                reply_markup=buttons,
+            )
+            sent += 1
+        except Exception:
+            logger.info("Unable to send SaaS payment to super-admin %s", super_admin_id)
+    await update.message.reply_text(
+        "SaaS payment request super-admin ko bhej di gayi hai. Approval ke baad dashboard unlock hoga."
+        if sent
+        else "Payment save ho gayi, lekin super-admin DM deliver nahi hua. /superadmin ke pending queue se review ho sakti hai."
+    )
+    return ConversationHandler.END
+
+
+async def superadmin_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in SUPER_ADMIN_IDS:
+        await update.message.reply_text("Ye command sirf platform super-admin ke liye hai.")
+        return
+    try:
+        rows = (
+            sb.table("saas_payments")
+            .select("id,user_id,amount,utr_number,created_at")
+            .eq("status", "PENDING")
+            .order("created_at")
+            .limit(20)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        logger.exception("SaaS pending queue failed")
+        await update.message.reply_text("SaaS payment queue read nahi hui; migration check karo.")
+        return
+    if not rows:
+        await update.message.reply_text("Koi SaaS payment pending nahi hai.")
+        return
+    for row in rows:
+        caption = f"SaaS payment | Admin ID {row['user_id']} | Rs {row['amount']} | UTR {row['utr_number']}"
+        buttons = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("✅ Approve", callback_data=f"saasapp:{row['id']}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"saasrej:{row['id']}"),
+            ]]
+        )
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=(
+                    sb.table("saas_payments")
+                    .select("screenshot_file_id")
+                    .eq("id", row["id"])
+                    .single()
+                    .execute()
+                    .data["screenshot_file_id"]
+                ),
+                caption=caption,
+                reply_markup=buttons,
+            )
+        except Exception:
+            logger.exception("SaaS pending payment display failed")
+
+
+async def saas_payment_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action, payment_id_s = query.data.split(":")
+    if query.from_user.id not in SUPER_ADMIN_IDS:
+        await safe_answer(query, "Sirf platform super-admin review kar sakta hai.", alert=True)
+        return
+    try:
+        payment = (
+            sb.table("saas_payments")
+            .select("*")
+            .eq("id", int(payment_id_s))
+            .maybe_single()
+            .execute()
+            .data
+        )
+    except Exception:
+        payment = None
+    if not payment or payment.get("status") != "PENDING":
+        await safe_answer(query, "Payment nahi mili ya pehle review ho chuki hai.", alert=True)
+        return
+    if action == "saasrej":
+        try:
+            sb.table("saas_payments").update(
+                {"status": "REJECTED", "reviewed_by": query.from_user.id, "reviewed_at": now_utc().isoformat()}
+            ).eq("id", payment["id"]).eq("status", "PENDING").execute()
+        except Exception:
+            logger.exception("SaaS payment rejection failed")
+            await safe_answer(query, "Database error.", alert=True)
+            return
+        await safe_answer(query, "Payment reject kar di.")
+        await context.bot.send_message(
+            chat_id=payment["user_id"],
+            text="SaaS payment approve nahi hui. UTR/screenshot verify karke platform admin se rabta karo.",
+        )
+        try:
+            await query.edit_message_caption(caption=(query.message.caption or "") + "\n\nStatus: REJECTED")
+        except Exception:
+            pass
+        return
+
+    account = get_admin_account(payment["user_id"])
+    if account is None:
+        await safe_answer(query, "Admin billing account nahi mila.", alert=True)
+        return
+    now = now_utc()
+    old_until = parse_dt(account.get("paid_until"))
+    start = old_until if old_until and old_until > now else now
+    paid_until = start + timedelta(days=int(payment.get("billing_days") or SAAS_BILLING_DAYS))
+    try:
+        claimed = (
+            sb.table("saas_payments")
+            .update(
+                {"status": "APPROVED", "reviewed_by": query.from_user.id, "reviewed_at": now.isoformat()}
+            )
+            .eq("id", payment["id"])
+            .eq("status", "PENDING")
+            .select("id")
+            .execute()
+        )
+        if not claimed.data:
+            await safe_answer(query, "Ye payment pehle review ho chuki hai.", alert=True)
+            return
+        sb.table("admin_accounts").update(
+            {
+                "subscription_status": "ACTIVE",
+                "paid_until": paid_until.isoformat(),
+                "updated_at": now.isoformat(),
+            },
+        ).eq("user_id", payment["user_id"]).execute()
+    except Exception:
+        logger.exception("SaaS payment approval persistence failed")
+        try:
+            sb.table("saas_payments").update(
+                {"status": "PENDING", "reviewed_by": None, "reviewed_at": None}
+            ).eq("id", payment["id"]).eq("status", "APPROVED").execute()
+        except Exception:
+            logger.exception("SaaS payment rollback failed")
+        await safe_answer(query, "Database error; subscription unlock nahi hui.", alert=True)
+        return
+    await safe_answer(query, "Admin SaaS plan approve ho gaya.")
+    try:
+        await query.edit_message_caption(caption=(query.message.caption or "") + f"\n\nStatus: APPROVED\nUntil: {fmt_ist(paid_until)}")
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            chat_id=payment["user_id"],
+            text=f"SaaS payment approve ho gayi. Dashboard {fmt_ist(paid_until)} tak unlock hai. /dashboard kholo.",
+        )
+    except Exception:
+        logger.exception("SaaS approval DM failed")
+
+
 async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Join request sirf approved (payment wale) member ki hi approve hogi."""
     req = update.chat_join_request
     group = get_group_by_chat(req.chat.id)
-    approved = False
-    if group:
-        member = get_member(group["id"], req.from_user.id)
-        if member and member.get("status") == "ACTIVE":
-            expiry = parse_dt(member.get("expiry_date"))
-            if expiry and expiry > now_utc():
-                approved = True
+    if not group:
+        return  # Is bot ke liye register na kiye gaye groups ko touch na karein.
+    if not group_is_active(group):
+        try:
+            await context.bot.decline_chat_join_request(req.chat.id, req.from_user.id)
+            await context.bot.send_message(
+                chat_id=req.from_user.id,
+                text=f"{group['title']} ka access process filhaal available nahi hai. Group owner se rabta karo.",
+            )
+        except Exception:
+            logger.exception("inactive group join request handling failed")
+        return
+    if not group.get("gatekeeper_enabled", True):
+        try:
+            await context.bot.approve_chat_join_request(req.chat.id, req.from_user.id)
+        except Exception:
+            logger.exception("unmanaged join request approval failed")
+        return
+    owner_access, _, _ = admin_account_access(group["owner_user_id"], create=False)
+    approved = owner_access and member_is_active(group["id"], req.from_user.id)
     try:
         if approved:
             await context.bot.approve_chat_join_request(req.chat.id, req.from_user.id)
@@ -543,8 +983,10 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await context.bot.decline_chat_join_request(req.chat.id, req.from_user.id)
             await context.bot.send_message(
                 chat_id=req.from_user.id,
-                text="Tumhari join request approve nahi ho saki kyunki tumhari paid "
-                "membership record nahi mili. Pehle bot se payment flow complete karo.",
+                text=(
+                    f"{group['title']} me access ke liye pehle paid plan select aur verify karo. "
+                    f"Process yahan se shuru karo: https://t.me/{context.bot.username}?start=g{group['id']}"
+                ),
             )
     except Exception:
         logger.exception("join request handling failed")
@@ -559,10 +1001,39 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("/setup group ke andar chalana hai, jahan bot admin ho.")
         return
+    if chat.type != "supergroup":
+        await update.message.reply_text(
+            "Per-member mute aur paid join approvals ke liye Telegram Supergroup chahiye. "
+            "Group ko Supergroup me upgrade karke /setup dobara chalao."
+        )
+        return
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
             await update.message.reply_text("Sirf group admin hi /setup kar sakta hai.")
+            return
+        bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
+            await update.message.reply_text(
+                "Pehle bot ko group admin banao. Gatekeeper ke liye Restrict members, "
+                "Delete messages aur Invite users permissions zaroori hain."
+            )
+            return
+        if not getattr(bot_member, "can_restrict_members", False):
+            await update.message.reply_text(
+                "Bot admin hai, lekin Restrict members permission nahi hai. "
+                "Is permission ko enable karke /setup dobara chalao."
+            )
+            return
+        if not getattr(bot_member, "can_delete_messages", False):
+            await update.message.reply_text(
+                "Bot ko Delete messages permission bhi do, taaki spam aur service messages hata sake."
+            )
+            return
+        if not getattr(bot_member, "can_invite_users", False):
+            await update.message.reply_text(
+                "Bot ko Invite users permission bhi do, taaki paid join requests approve ho saken."
+            )
             return
     except Exception:
         await update.message.reply_text("Admin status check nahi ho saka. Bot ko group admin banao pehle.")
@@ -577,9 +1048,24 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    has_access, _, trial_until = admin_account_access(user.id)
+    if not has_access:
+        await update.message.reply_text(
+            "Tumhara SaaS trial khatm ho gaya hai. Naya group register karne ke liye "
+            f"bot DM me /billing kholo (trial end: {fmt_ist(trial_until)})."
+        )
+        return
+
     try:
         res = sb.table("groups").insert(
-            {"chat_id": chat.id, "title": chat.title or "", "owner_user_id": user.id}
+            {
+                "chat_id": chat.id,
+                "title": chat.title or "",
+                "owner_user_id": user.id,
+                "gatekeeper_enabled": True,
+                "anti_spam_enabled": True,
+                "flood_control_enabled": True,
+            }
         ).execute()
         gid = res.data[0]["id"]
     except Exception:
@@ -587,18 +1073,25 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Registration me masla aaya, dobara try karo.")
         return
 
+    account = get_admin_account(user.id)
+    if not account:
+        logger.error("Admin trial could not be initialized for user %s", user.id)
+
     await update.message.reply_text(
         f"Group registered ho gaya: {chat.title}\n\n"
         f"Members ke liye join link:\nhttps://t.me/{context.bot.username}?start=g{gid}\n\n"
-        "Ab bot ko DM me /admin likh kar UPI ID/QR aur plans set karo. "
-        "Dhyaan: expiry par auto-remove ke liye bot ke paas 'Ban users' permission hona chahiye."
+        "Ab bot ko DM me /dashboard likh kar UPI ID/QR, plans, welcome, FAQ aur moderation set karo. "
+        "Tumhara 7-day free trial ab shuru ho gaya hai."
     )
 
 
 # --------------------------------------------------------------------------
 # ADMIN DASHBOARD: /admin (bot DM)
 # --------------------------------------------------------------------------
-def dashboard_markup(group_id: int) -> InlineKeyboardMarkup:
+def dashboard_markup(group: dict) -> InlineKeyboardMarkup:
+    group_id = group["id"]
+    links = bool(group.get("anti_spam_enabled", True))
+    flood = bool(group.get("flood_control_enabled", True))
     return InlineKeyboardMarkup(
         [
             [
@@ -613,7 +1106,29 @@ def dashboard_markup(group_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Active Members", callback_data=f"adm:members:{group_id}"),
                 InlineKeyboardButton("Revenue Stats", callback_data=f"adm:rev:{group_id}"),
             ],
+            [InlineKeyboardButton("Pending Approvals", callback_data=f"adm:pending:{group_id}")],
+            [
+                InlineKeyboardButton(
+                    f"Gatekeeper: {'ON' if group.get('gatekeeper_enabled', True) else 'OFF'}",
+                    callback_data=f"adm:gatekeeper:{group_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"Link Blocker: {'ON' if links else 'OFF'}",
+                    callback_data=f"adm:linkblock:{group_id}",
+                ),
+                InlineKeyboardButton(
+                    f"Flood Control: {'ON' if flood else 'OFF'}",
+                    callback_data=f"adm:flood:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton("Set Welcome Message", callback_data=f"adm:welcome:{group_id}"),
+                InlineKeyboardButton("Auto-Reply FAQ", callback_data=f"adm:faq:{group_id}"),
+            ],
             [InlineKeyboardButton("Broadcast Message", callback_data=f"adm:bcast:{group_id}")],
+            [InlineKeyboardButton("SaaS Billing", callback_data=f"adm:billing:{group_id}")],
             [InlineKeyboardButton("<< Mere Groups", callback_data="adm:back")],
         ]
     )
@@ -630,8 +1145,8 @@ async def show_group_list(message_or_query, user_id: int):
     if not groups:
         text = (
             "Tumhara koi group registered nahi hai.\n\n"
-            "Steps:\n1) Bot ko apne group me add karo aur admin banao (Ban users permission ke saath).\n"
-            "2) Group ke andar /setup likho.\n3) Phir yahan /admin se settings karo."
+            "Steps:\n1) Bot ko Supergroup me add karke admin banao (Restrict members, Delete messages, Invite users).\n"
+            "2) Group ke andar /setup likho.\n3) Phir yahan /dashboard se settings karo."
         )
         if hasattr(message_or_query, "reply_text"):
             await message_or_query.reply_text(text)
@@ -652,6 +1167,36 @@ async def show_group_list(message_or_query, user_id: int):
 
 
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        owned_groups = (
+            sb.table("groups")
+            .select("id")
+            .eq("owner_user_id", update.effective_user.id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        owned_groups = []
+    if not owned_groups:
+        return await show_group_list(update.message, update.effective_user.id)
+    access, status, until = admin_account_access(update.effective_user.id)
+    if not access:
+        account = get_admin_account(update.effective_user.id)
+        if account is None:
+            await update.message.reply_text(
+                "Admin billing database setup nahi hua. Platform admin se rabta karo."
+            )
+            return ConversationHandler.END
+        await update.message.reply_text(
+            f"Tumhara 7-day trial khatm ho gaya hai. Dashboard unlock karne ke liye "
+            f"Rs {SAAS_MONTHLY_PRICE}/30 din ka SaaS plan lo.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💳 SaaS Plan / Billing", callback_data="billing:open")]]
+            ),
+        )
+        return ConversationHandler.END
     return await show_group_list(update.message, update.effective_user.id)
 
 
@@ -660,14 +1205,26 @@ async def show_dashboard(query, group: dict):
     plan_lines = "\n".join(
         f"  {PLAN_NAMES[l]}: Rs {plans[l]['price']} ({plans[l]['days']} din)" for l in ("1m", "3m", "1yr")
     )
+    _, billing_status, billing_until = admin_account_access(query.from_user.id)
+    billing_line = (
+        f"SaaS: {billing_status} until {fmt_ist(billing_until)}"
+        if billing_until
+        else f"SaaS: {billing_status}"
+    )
+    if billing_status == "BILLING_SETUP_REQUIRED":
+        billing_line = "SaaS billing setup pending; trial lock will start after configuration"
     text = (
         f"*{group['title']}*\n"
+        f"{billing_line}\n"
         f"UPI ID: `{group.get('upi_id') or 'set nahi hai'}`\n"
         f"QR Photo: {'set hai' if group.get('upi_qr_file_id') else 'set nahi hai'}\n"
-        f"Plans:\n{plan_lines}"
+        f"Plans:\n{plan_lines}\n\n"
+        f"Welcome message: {'custom' if group.get('welcome_message') else 'default'}\n"
+        f"FAQ keywords: {len(group.get('faq_replies') or {})}\n"
+        f"Gatekeeper: {'ON' if group.get('gatekeeper_enabled', True) else 'OFF'}"
     )
     await query.edit_message_text(
-        text, reply_markup=dashboard_markup(group["id"]), parse_mode="Markdown"
+        text, reply_markup=dashboard_markup(group), parse_mode="Markdown"
     )
 
 
@@ -676,6 +1233,17 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_answer(query)
     parts = query.data.split(":")
     action = parts[1]
+
+    access, _, until = admin_account_access(query.from_user.id)
+    if not access and action != "billing":
+        await query.edit_message_text(
+            f"Tumhara trial/subscription khatm ho gaya hai. Dashboard unlock karne ke liye "
+            f"Rs {SAAS_MONTHLY_PRICE}/{SAAS_BILLING_DAYS} din ka plan lo.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💳 SaaS Billing", callback_data="billing:open")]]
+            ),
+        )
+        return ConversationHandler.END
 
     if action == "back":
         return await show_group_list(query, query.from_user.id)
@@ -686,6 +1254,21 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_answer(query, "Ye group tumhara nahi hai.", alert=True)
         return A_NAV
     context.user_data["adm_group_id"] = group_id
+
+    if action == "billing":
+        account = get_admin_account(query.from_user.id) or {}
+        billing_until = parse_dt(account.get("paid_until")) or parse_dt(account.get("trial_ends_at"))
+        details = f"Current status: {account.get('subscription_status', 'UNKNOWN')}"
+        if billing_until:
+            details += f"\nValid until: {fmt_ist(billing_until)}"
+        await query.edit_message_text(
+            f"SaaS Billing\n{details}\n\n"
+            f"Plan: Rs {SAAS_MONTHLY_PRICE} / {SAAS_BILLING_DAYS} din",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("💳 Pay and Submit UTR", callback_data="billing:open")]]
+            ),
+        )
+        return A_NAV
 
     if action == "grp":
         await show_dashboard(query, group)
@@ -727,8 +1310,83 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         link = f"https://t.me/{context.bot.username}?start=g{group_id}"
         await query.edit_message_text(
             f"Members ke liye join link:\n{link}\n\nYe link apne free channel/YouTube/Instagram par lagao.",
-            reply_markup=dashboard_markup(group_id),
+            reply_markup=dashboard_markup(group),
         )
+        return A_NAV
+
+    if action in ("gatekeeper", "linkblock", "flood"):
+        field = {
+            "gatekeeper": "gatekeeper_enabled",
+            "linkblock": "anti_spam_enabled",
+            "flood": "flood_control_enabled",
+        }[action]
+        try:
+            new_value = not bool(group.get(field, True))
+            sb.table("groups").update({field: new_value}).eq("id", group_id).execute()
+            group[field] = new_value
+        except Exception:
+            logger.exception("moderation setting update failed")
+            await query.edit_message_text(
+                "Setting save nahi hui. Supabase migration apply hui hai ya nahi check karo.",
+                reply_markup=dashboard_markup(group),
+            )
+            return A_NAV
+        await show_dashboard(query, group)
+        return A_NAV
+
+    if action == "welcome":
+        await query.edit_message_text(
+            "Custom welcome message bhejo (max 500 characters).\n"
+            "`{name}` aur `{group}` placeholders use kar sakte ho.\n"
+            "Default welcome restore karne ke liye /clear bhejo."
+        )
+        return A_WELCOME
+
+    if action == "faq":
+        await query.edit_message_text(
+            "Auto-reply entries ek-ek line me bhejo: `keyword = reply`\n"
+            "Misal: `price = Plans ke liye /start kholo`\n"
+            "Existing entries update hongi. FAQ saaf karne ke liye /clear bhejo."
+        )
+        return A_FAQ
+
+    if action == "pending":
+        try:
+            rows = (
+                sb.table("payments")
+                .select("id,full_name,username,plan_label,amount,utr_number,created_at")
+                .eq("group_id", group_id)
+                .eq("status", "PENDING")
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+                .data
+                or []
+            )
+        except Exception:
+            logger.exception("pending payment list failed")
+            rows = []
+        if not rows:
+            await query.edit_message_text(
+                "Koi pending approval nahi hai.", reply_markup=dashboard_markup(group)
+            )
+            return A_NAV
+        lines = ["Pending approvals (latest 10):"]
+        buttons = []
+        for row in rows:
+            lines.append(
+                f"\n{row.get('full_name') or '-'} (@{row.get('username') or '-'}) | "
+                f"{PLAN_NAMES.get(row.get('plan_label'), row.get('plan_label'))} | "
+                f"Rs {row.get('amount')} | UTR {row.get('utr_number')}"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"payapp:{row['id']}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"payrej:{row['id']}"),
+                ]
+            )
+        buttons.append([InlineKeyboardButton("<< Dashboard", callback_data=f"adm:grp:{group_id}")])
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
         return A_NAV
 
     if action == "members":
@@ -757,7 +1415,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"expiry {fmt_ist(r.get('expiry_date'))}"
                 )
             text = "\n".join(lines)
-        await query.edit_message_text(text, reply_markup=dashboard_markup(group_id))
+        await query.edit_message_text(text, reply_markup=dashboard_markup(group))
         return A_NAV
 
     if action == "rev":
@@ -786,7 +1444,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Pending approval: {len(pending)}\n\n"
             "Note: Paisa seedha tumhare UPI me aata hai, bot sirf record rakhta hai."
         )
-        await query.edit_message_text(text, reply_markup=dashboard_markup(group_id))
+        await query.edit_message_text(text, reply_markup=dashboard_markup(group))
         return A_NAV
 
     if action == "bcast":
@@ -796,6 +1454,55 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return A_BCAST
 
     return A_NAV
+
+
+async def admin_welcome_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group_id = context.user_data.get("adm_group_id")
+    text = (update.message.text or "").strip()
+    value = None if text.lower() == "/clear" else text
+    if value and len(value) > 500:
+        await update.message.reply_text("Message 500 characters se chhota rakho:")
+        return A_WELCOME
+    try:
+        sb.table("groups").update({"welcome_message": value}).eq("id", group_id).execute()
+    except Exception:
+        logger.exception("welcome message update failed")
+        await update.message.reply_text("Save nahi hua. Supabase migration apply hui hai ya nahi check karo.")
+        return ConversationHandler.END
+    await update.message.reply_text("Welcome message save ho gaya. Dashboard ke liye /dashboard kholo.")
+    return ConversationHandler.END
+
+
+async def admin_faq_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group_id = context.user_data.get("adm_group_id")
+    text = (update.message.text or "").strip()
+    current_group = get_group_by_id(group_id)
+    faq = dict((current_group or {}).get("faq_replies") or {})
+    if text.lower() == "/clear":
+        faq = {}
+    else:
+        parsed = {}
+        for line in text.splitlines():
+            if "=" not in line:
+                await update.message.reply_text("Har line `keyword = reply` format me likho:")
+                return A_FAQ
+            keyword, reply = (piece.strip() for piece in line.split("=", 1))
+            if not keyword or not reply or len(keyword) > 64 or len(reply) > 500:
+                await update.message.reply_text("Keyword 1–64 aur reply 1–500 characters ka hona chahiye:")
+                return A_FAQ
+            parsed[keyword.lower()] = reply
+        faq.update(parsed)
+        if len(faq) > 30:
+            await update.message.reply_text("Ek group me maximum 30 FAQ keywords rakh sakte ho.")
+            return A_FAQ
+    try:
+        sb.table("groups").update({"faq_replies": faq}).eq("id", group_id).execute()
+    except Exception:
+        logger.exception("FAQ update failed")
+        await update.message.reply_text("FAQ save nahi hui. Supabase migration apply hui hai ya nahi check karo.")
+        return ConversationHandler.END
+    await update.message.reply_text(f"FAQ save ho gaya ({len(faq)} keyword). Dashboard ke liye /dashboard kholo.")
+    return ConversationHandler.END
 
 
 async def admin_upi_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -864,7 +1571,7 @@ async def admin_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYP
 # --------------------------------------------------------------------------
 async def get_admin_ids(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> set[int]:
     ts, cached = _admin_cache.get(chat_id, (0, set()))
-    if now_utc().timestamp() - ts < 300 and cached:
+    if now_utc().timestamp() - ts < 300:
         return cached
     try:
         admins = await context.bot.get_chat_administrators(chat_id)
@@ -881,47 +1588,159 @@ async def group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = msg.chat_id
     user_id = msg.from_user.id
-    if user_id in await get_admin_ids(context, chat_id):
-        return  # admins par koi pabandi nahi
+    group = get_group_by_chat(chat_id)
+    if not group_is_active(group):
+        return
+    is_admin = user_id == group["owner_user_id"] or user_id in await get_admin_ids(context, chat_id)
+    if not is_admin and group.get("gatekeeper_enabled", True) and not member_is_active(group["id"], user_id):
+        await gate_member(context, group, msg.from_user)
+        try:
+            await msg.delete()
+        except Exception:
+            logger.info("Unable to delete message from ungated user %s", user_id)
+        return
+    if is_admin:
+        return  # admins par moderation nahi chalegi
 
     should_delete = False
-    # Links / forwards block
-    if msg.forward_origin is not None:
+    reason = None
+    # Telegram entities cover hidden text links; the expression also catches plain t.me and @mentions.
+    body = (msg.text or msg.caption or "").strip()
+    entities = list(msg.entities or []) + list(msg.caption_entities or [])
+    has_url_entity = any(getattr(entity, "type", "") in ("url", "text_link") for entity in entities)
+    if group.get("anti_spam_enabled", True) and (
+        msg.forward_origin is not None or has_url_entity or LINK_RE.search(body)
+    ):
         should_delete = True
-    if msg.entities:
-        for ent in msg.entities:
-            if ent.type in ("url", "text_link"):
-                should_delete = True
-                break
+        reason = "Links aur forwarded messages is group me allowed nahi hain."
 
     # Flood control: 10 second me 5 se zyada message = 10 min mute
-    key = (chat_id, user_id)
-    now_ts = now_utc().timestamp()
-    hits = [t for t in _flood.get(key, []) if now_ts - t < 10]
-    hits.append(now_ts)
-    _flood[key] = hits
-    if len(hits) > 5:
-        _flood[key] = []
-        should_delete = True
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id,
-                user_id,
-                permissions=ChatPermissions(can_send_messages=False),
-                until_date=now_utc() + timedelta(minutes=10),
-            )
-            await context.bot.send_message(
-                chat_id,
-                f"{msg.from_user.first_name}, flood karne par 10 minute ke liye mute kar diya gaya hai.",
-            )
-        except Exception:
-            logger.exception("flood restrict failed")
+    if group.get("flood_control_enabled", True):
+        key = (chat_id, user_id)
+        now_ts = now_utc().timestamp()
+        hits = [t for t in _flood.get(key, []) if now_ts - t < 10]
+        hits.append(now_ts)
+        _flood[key] = hits
+        if len(hits) > 5:
+            _flood[key] = []
+            should_delete = True
+            reason = "Flood control: 10 second me 5 se zyada messages par 10 minute mute hua."
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions.no_permissions(),
+                    until_date=now_utc() + timedelta(minutes=10),
+                    use_independent_chat_permissions=True,
+                )
+            except Exception:
+                logger.exception("flood restrict failed")
 
     if should_delete:
         try:
             await msg.delete()
         except Exception:
-            pass  # bot ke paas delete permission na ho to chup chaap aage badho
+            logger.info("Unable to delete spam message in chat %s", chat_id)
+        warning = None
+        try:
+            warning = await context.bot.send_message(chat_id, reason or "Message delete kar diya gaya.")
+        except Exception:
+            logger.info("Unable to post moderation warning in chat %s", chat_id)
+        if warning:
+            schedule_message_delete(context, chat_id, warning.message_id, delay=60)
+        return
+
+    # Keyword FAQ auto-replies run only for ordinary, non-command messages.
+    faq = group.get("faq_replies") or {}
+    if body and isinstance(faq, dict):
+        lowered = body.casefold()
+        for keyword, reply in sorted(faq.items(), key=lambda item: len(item[0]), reverse=True):
+            if keyword and keyword.casefold() in lowered:
+                try:
+                    answer = await context.bot.send_message(chat_id, reply, reply_to_message_id=msg.message_id)
+                    schedule_message_delete(context, chat_id, answer.message_id, delay=120)
+                except Exception:
+                    logger.exception("FAQ reply failed")
+                break
+
+
+def schedule_message_delete(context, chat_id: int, message_id: int, delay: int = 120):
+    if context.job_queue:
+        context.job_queue.run_once(
+            delete_message_job,
+            when=delay,
+            data={"chat_id": chat_id, "message_id": message_id},
+            name=f"delete-{chat_id}-{message_id}",
+        )
+
+
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["message_id"])
+    except Exception:
+        pass
+
+
+async def gate_member(context, group: dict, member):
+    """Mute unentitled joins and show the private payment-process link."""
+    chat_id = group["chat_id"]
+    user_id = member.id
+    now_ts = now_utc().timestamp()
+    key = (chat_id, user_id)
+    if now_ts - _join_seen.get(key, 0) < 60:
+        return
+    _join_seen[key] = now_ts
+    if len(_join_seen) > 1000:
+        for seen_key, seen_at in list(_join_seen.items()):
+            if now_ts - seen_at > 300:
+                _join_seen.pop(seen_key, None)
+    if user_id == group["owner_user_id"] or user_id in await get_admin_ids(context, chat_id):
+        return
+    active = member_is_active(group["id"], user_id)
+    if group.get("gatekeeper_enabled", True):
+        if active:
+            await unrestrict_if_joined(context, chat_id, user_id)
+        else:
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions.no_permissions(),
+                    use_independent_chat_permissions=True,
+                )
+            except Exception:
+                logger.exception("gatekeeper restriction failed for user %s", user_id)
+                try:
+                    await context.bot.send_message(
+                        chat_id=group["owner_user_id"],
+                        text=(
+                            f"Gatekeeper {group['title']} me user ko restrict nahi kar saka. "
+                            "Bot ko Supergroup admin bana kar Restrict members permission check karo."
+                        ),
+                    )
+                except Exception:
+                    pass
+
+    template = group.get("welcome_message") or "Welcome {name} to {group}!"
+    greeting = template.replace("{name}", member.first_name or "Member").replace("{group}", group["title"])
+    if not active and group.get("gatekeeper_enabled", True):
+        greeting += "\n\nAccess paane ke liye payment aur verification process complete karo."
+        keyboard = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "🚀 Complete Process / Join VIP",
+                    url=f"https://t.me/{context.bot.username}?start=g{group['id']}",
+                )
+            ]]
+        )
+    else:
+        keyboard = None
+    try:
+        welcome = await context.bot.send_message(chat_id, greeting, reply_markup=keyboard)
+        schedule_message_delete(context, chat_id, welcome.message_id, delay=120)
+    except Exception:
+        logger.exception("welcome message failed for group %s", group["id"])
 
 
 async def welcome_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -929,19 +1748,35 @@ async def welcome_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.new_chat_members:
         return
     group = get_group_by_chat(msg.chat_id)
-    title = group["title"] if group else msg.chat.title
+    if not group_is_active(group):
+        return
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
-        try:
-            await context.bot.send_message(
-                msg.chat_id,
-                f"Welcome {member.first_name}! Tum {title} me aa gaye ho.\n"
-                "Rules: koi spam/link nahi, sab ki izzat karo. "
-                "Membership expiry se pehle bot tumhe renewal reminder bhejega.",
-            )
-        except Exception:
-            pass
+        await gate_member(context, group, member)
+    schedule_message_delete(context, msg.chat_id, msg.message_id, delay=120)
+
+
+async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    member_update = update.chat_member
+    if not member_update:
+        return
+    old = member_update.old_chat_member
+    new = member_update.new_chat_member
+    was_member = old.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ) or (old.status == ChatMemberStatus.RESTRICTED and getattr(old, "is_member", False))
+    is_member = new.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.OWNER,
+    ) or (new.status == ChatMemberStatus.RESTRICTED and getattr(new, "is_member", False))
+    if is_member and not was_member and not new.user.is_bot:
+        group = get_group_by_chat(member_update.chat.id)
+        if group:
+            await gate_member(context, group, new.user)
 
 
 async def delete_service_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1028,11 +1863,28 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
 
         if expiry <= now:
             # Expire: kick (ban + unban, taaki renew karke dobara aa sake)
+            enforcement_succeeded = False
             try:
                 await context.bot.ban_chat_member(group["chat_id"], m["user_id"])
-                await context.bot.unban_chat_member(group["chat_id"], m["user_id"], only_if_banned=True)
+                enforcement_succeeded = True
+                try:
+                    await context.bot.unban_chat_member(group["chat_id"], m["user_id"], only_if_banned=True)
+                except Exception:
+                    logger.exception("Unable to unban kicked member %s for renewal", m["id"])
             except Exception:
-                logger.exception("auto-kick failed for member %s", m["id"])
+                logger.exception("auto-kick failed for member %s; trying temporary restriction", m["id"])
+                try:
+                    await context.bot.restrict_chat_member(
+                        chat_id=group["chat_id"],
+                        user_id=m["user_id"],
+                        permissions=ChatPermissions.no_permissions(),
+                        use_independent_chat_permissions=True,
+                    )
+                    enforcement_succeeded = True
+                except Exception:
+                    logger.exception("auto-restrict failed for expired member %s", m["id"])
+            if not enforcement_succeeded:
+                continue  # retry next cycle; don't record expiry when access was not removed
             try:
                 sb.table("members").update({"status": "EXPIRED"}).eq("id", m["id"]).execute()
                 await context.bot.send_message(
@@ -1076,6 +1928,11 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    if not SUPER_ADMIN_IDS or not PLATFORM_UPI_ID:
+        logger.warning(
+            "SaaS billing is not configured. Set SUPER_ADMIN_IDS and PLATFORM_UPI_ID in Render."
+        )
+
     payment_conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start_cmd),
@@ -1091,7 +1948,9 @@ def main():
     )
 
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_start, filters=filters.ChatType.PRIVATE)],
+        entry_points=[
+            CommandHandler(["admin", "dashboard"], admin_start, filters=filters.ChatType.PRIVATE)
+        ],
         states={
             A_NAV: [CallbackQueryHandler(admin_router, pattern=r"^adm:")],
             A_UPI: [
@@ -1110,6 +1969,29 @@ def main():
                 CallbackQueryHandler(admin_router, pattern=r"^adm:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_text),
             ],
+            A_WELCOME: [
+                CallbackQueryHandler(admin_router, pattern=r"^adm:"),
+                CommandHandler("clear", admin_welcome_text),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_welcome_text),
+            ],
+            A_FAQ: [
+                CallbackQueryHandler(admin_router, pattern=r"^adm:"),
+                CommandHandler("clear", admin_faq_text),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_faq_text),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
+        allow_reentry=True,
+    )
+
+    billing_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("billing", billing_start, filters=filters.ChatType.PRIVATE),
+            CallbackQueryHandler(billing_start, pattern=r"^billing:open$"),
+        ],
+        states={
+            BILLING_SCREENSHOT: [MessageHandler(filters.PHOTO, billing_screenshot_received)],
+            BILLING_UTR: [MessageHandler(filters.TEXT & ~filters.COMMAND, billing_utr_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
         allow_reentry=True,
@@ -1117,9 +1999,13 @@ def main():
 
     app.add_handler(payment_conv)
     app.add_handler(admin_conv)
+    app.add_handler(billing_conv)
     app.add_handler(CallbackQueryHandler(pay_decision, pattern=r"^(payapp|payrej):\d+$"))
+    app.add_handler(CallbackQueryHandler(saas_payment_decision, pattern=r"^saas(app|rej):\d+$"))
+    app.add_handler(CommandHandler("superadmin", superadmin_pending, filters=filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("setup", setup_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(ChatJoinRequestHandler(join_request_handler))
+    app.add_handler(ChatMemberHandler(chat_member_update, ChatMemberHandler.CHAT_MEMBER))
 
     # Group moderation (status updates pehle, phir aam messages)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_member), group=0)
@@ -1134,11 +2020,13 @@ def main():
 
     # Background jobs
     app.job_queue.run_repeating(followup_job, interval=900, first=60, name="followup")
-    app.job_queue.run_repeating(expiry_job, interval=3600, first=120, name="expiry")
+    app.job_queue.run_repeating(expiry_job, interval=900, first=120, name="expiry")
 
     app.add_error_handler(error_handler)
     logger.info("Bot start ho raha hai...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=["message", "callback_query", "chat_member", "chat_join_request", "my_chat_member"]
+    )
 
 
 if __name__ == "__main__":
