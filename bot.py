@@ -250,7 +250,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
     hint = "\n\nTum admin ho? Dashboard ke liye /admin likho." if owned else ""
     await update.message.reply_text(
-        "Salam! Main paid Telegram groups manage karne wala bot hoon.\n"
+        "Welcome! Main paid Telegram groups manage karne wala bot hoon.\n"
         "Kisi group me join karna hai to admin ka diya hua join link use karo." + hint
     )
     return ConversationHandler.END
