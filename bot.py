@@ -287,6 +287,124 @@ def member_is_active(group_id: int, user_id: int) -> bool:
     return bool(expiry and expiry > now_utc())
 
 
+# --------------------------------------------------------------------------
+# Read-only mode, title sync, unban + join-link helpers (points 1, 3, 4, 6)
+# --------------------------------------------------------------------------
+def member_chat_enabled(group: dict | None) -> bool:
+    """Dashboard toggle: False (default) = read-only/broadcast mode,
+    True = paid members group me chat kar sakte hain."""
+    return bool(group and group.get("member_chat_enabled", False))
+
+
+async def apply_member_chat_mode(bot, group: dict) -> bool:
+    """Group ke default permissions toggle ke hisaab se set karo.
+
+    Read-only mode me Telegram members ko message typing box hi nahi dikhata —
+    sirf Mute/Unmute button rehta hai. Group admins par ye pabandi laagu nahi hoti.
+    """
+    try:
+        perms = (
+            ChatPermissions.all_permissions()
+            if member_chat_enabled(group)
+            else ChatPermissions.no_permissions()
+        )
+        await bot.set_chat_permissions(chat_id=group["chat_id"], permissions=perms)
+        return True
+    except Exception:
+        logger.exception("set_chat_permissions failed for group %s", group.get("id"))
+        return False
+
+
+async def sync_group_title(bot, group: dict) -> dict:
+    """get_chat se taaza title lekar DB me sync karo (purana cached naam atak jata hai)."""
+    try:
+        chat = await bot.get_chat(group["chat_id"])
+    except Exception:
+        return group
+    fresh = getattr(chat, "title", None)
+    if fresh and fresh != group.get("title"):
+        try:
+            sb.table("groups").update({"title": fresh}).eq("id", group["id"]).execute()
+            group["title"] = fresh
+        except Exception:
+            logger.exception("group title sync failed for group %s", group.get("id"))
+    return group
+
+
+async def ensure_unbanned(bot, chat_id: int, user_id: int):
+    """Banned member ko pehle unban karo, warna naya invite link 'expired' dikhta hai."""
+    try:
+        await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+    except Exception:
+        pass
+
+
+def render_custom_welcome(group: dict, first_name: str | None) -> str | None:
+    template = (group or {}).get("welcome_message")
+    if not template:
+        return None
+    return template.replace("{name}", first_name or "Member").replace(
+        "{group}", group.get("title") or ""
+    )
+
+
+def save_invite_message_id(group_id: int, user_id: int, message_id: int):
+    try:
+        sb.table("members").update({"invite_message_id": message_id}).eq(
+            "group_id", group_id
+        ).eq("user_id", user_id).execute()
+    except Exception:
+        logger.info("invite_message_id save nahi hua (migration 000002 pending ho sakti hai)")
+
+
+async def member_presence(bot, chat_id: int, user_id: int) -> bool:
+    """User group ke andar hai ya nahi (restricted-but-joined bhi andar mana jayega)."""
+    try:
+        cm = await bot.get_chat_member(chat_id, user_id)
+        return cm.status in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ) or (
+            cm.status == ChatMemberStatus.RESTRICTED
+            and getattr(cm, "is_member", False)
+        )
+    except Exception:
+        return False
+
+
+async def issue_join_link(bot, group: dict, user_id: int, intro: str) -> str | None:
+    """Unban -> ID-locked join link -> DM. DM ka message_id members me save hota hai
+    taaki join approve hone par usi message ko 'safaltapurvak jud gaye' me edit kiya ja sake."""
+    await ensure_unbanned(bot, group["chat_id"], user_id)
+    try:
+        link = await bot.create_chat_invite_link(
+            chat_id=group["chat_id"],
+            name=f"paid-{user_id}"[:32],
+            expire_date=now_utc() + timedelta(hours=24),
+            creates_join_request=True,
+        )
+    except Exception:
+        logger.exception("invite link create failed")
+        return None
+    member = get_member(group["id"], user_id)
+    expiry_line = ""
+    if member and member.get("expiry_date"):
+        expiry_line = f"\nMembership valid: {fmt_ist(member.get('expiry_date'))}"
+    text = (
+        f"{intro}{expiry_line}\n\n"
+        f"Join link (sirf tumhare liye, 24 ghante valid):\n{link.invite_link}\n\n"
+        "Link dabao aur 'Join Request' bhejo, bot tumhe auto-approve kar dega. "
+        "Link kisi ke saath share mat karna, wo kisi aur ke liye kaam nahi karega."
+    )
+    try:
+        sent = await bot.send_message(chat_id=user_id, text=text)
+        save_invite_message_id(group["id"], user_id, sent.message_id)
+    except Exception:
+        logger.exception("join link DM failed")
+    return link.invite_link
+
+
 def get_admin_account(user_id: int, *, create: bool = True):
     try:
         res = (
@@ -429,16 +547,22 @@ def run_health_server():
 # --------------------------------------------------------------------------
 async def show_plans(update: Update, context: ContextTypes.DEFAULT_TYPE, group: dict):
     plans = get_plans(group)
+    target = update.callback_query.message if update.callback_query else update.message
+    # Point 5: admin ka custom welcome message plan wale message se pehle DM me dikhao.
+    user = update.effective_user
+    welcome = render_custom_welcome(group, user.first_name if user else None)
+    if welcome:
+        try:
+            await target.reply_text(welcome)
+        except Exception:
+            pass
     text = (
         f"Welcome to *{group['title']}*\n\n"
         "Apna plan select karo. Payment ke baad admin approve karega "
         "aur tumhe private join link mil jayega (link sirf tumhare liye hoga)."
     )
     markup = plan_buttons(group["id"], plans)
-    if update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    await target.reply_text(text, reply_markup=markup, parse_mode="Markdown")
     return WAIT_PLAN
 
 
@@ -457,6 +581,26 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{group['title']} ka subscription process filhaal paused hai. Group owner se rabta karo."
             )
             return ConversationHandler.END
+        group = await sync_group_title(context.bot, group)
+        # Point 6: pehle se active paid member se dobara payment mat mango.
+        member = get_member(group["id"], update.effective_user.id)
+        if member and member.get("status") == "ACTIVE":
+            expiry = parse_dt(member.get("expiry_date"))
+            if expiry and expiry > now_utc():
+                if await member_presence(context.bot, group["chat_id"], update.effective_user.id):
+                    await update.message.reply_text(
+                        f"Tum {group['title']} ke pehle se active member ho.\n"
+                        f"Membership valid: {fmt_ist(expiry)}\n\n"
+                        "Dobara payment karne ki zaroorat nahi hai."
+                    )
+                    return ConversationHandler.END
+                await issue_join_link(
+                    context.bot,
+                    group,
+                    update.effective_user.id,
+                    f"Tumhari {group['title']} membership abhi active hai, lekin tum group se bahar ho. Ye raha naya join link:",
+                )
+                return ConversationHandler.END
         context.user_data["join_group_id"] = group["id"]
         return await show_plans(update, context, group)
 
@@ -484,6 +628,7 @@ async def renew_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not owner_access:
         await query.message.reply_text("Group owner ka SaaS plan paused hai. Owner se rabta karo.")
         return ConversationHandler.END
+    group = await sync_group_title(context.bot, group)
     context.user_data["join_group_id"] = group_id
     return await show_plans(update, context, group)
 
@@ -690,6 +835,7 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # APPROVE
+    group = await sync_group_title(context.bot, group)
     plans = get_plans(group)
     days = plans.get(payment["plan_label"], DEFAULT_PLANS["1m"])["days"]
     existing = get_member(group["id"], member_id)
@@ -746,22 +892,24 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # If they joined before paying, remove the gate immediately after approval.
-    already_in_group = await unrestrict_if_joined(context, group["chat_id"], member_id)
+    # Member group ke andar pehle se hai ya nahi?
+    already_in_group = await member_presence(context.bot, group["chat_id"], member_id)
+    if already_in_group and member_chat_enabled(group):
+        # Chat mode ON hai to gate hata do; read-only mode me group defaults hi kaafi hain.
+        await unrestrict_if_joined(context, group["chat_id"], member_id)
 
-    # ID-locked join link: join request sirf usi user ke liye approve hoga.
     link_text = ""
     if not already_in_group:
-        try:
-            link = await context.bot.create_chat_invite_link(
-                chat_id=group["chat_id"],
-                name=f"paid-{member_id}"[:32],
-                expire_date=now_utc() + timedelta(hours=24),
-                creates_join_request=True,
+        # Point 4: pehle unban (warna naya link 'expired' dikhta hai), phir ID-locked link + DM.
+        link_text = (
+            await issue_join_link(
+                context.bot,
+                group,
+                member_id,
+                f"Payment approve ho gayi! {group['title']} me tumhara swagat hai.",
             )
-            link_text = link.invite_link
-        except Exception:
-            logger.exception("invite link create failed")
+            or ""
+        )
 
     await safe_answer(query, "Approve ho gaya, member ko link bhej diya.")
     try:
@@ -771,24 +919,30 @@ async def pay_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    msg = (
-        f"Payment approve ho gayi! {group['title']} me tumhara swagat hai.\n"
-        f"Membership expiry: {fmt_ist(expiry)}\n\n"
-    )
     if already_in_group:
-        msg += "Tum group me pehle se ho; ab restrictions hata di gayi hain."
-    elif link_text:
-        msg += (
-            f"Join link (sirf tumhare liye, 24 ghante valid):\n{link_text}\n\n"
-            "Link dabao aur 'Join Request' bhejo, bot tumhe auto-approve kar dega. "
-            "Link kisi ke saath share mat karna, wo kisi aur ke liye kaam nahi karega."
+        note = (
+            "Tum group me pehle se ho; ab restrictions hata di gayi hain."
+            if member_chat_enabled(group)
+            else "Tum group me pehle se ho. Ye group read-only mode me hai, isme sirf admins post kar sakte hain."
         )
-    else:
-        msg += "Join link banane me masla aaya hai, admin se rabta karo."
-    try:
-        await context.bot.send_message(chat_id=member_id, text=msg)
-    except Exception:
-        logger.exception("member approve DM failed")
+        try:
+            await context.bot.send_message(
+                chat_id=member_id,
+                text=(
+                    f"Payment approve ho gayi! {group['title']} me tumhara swagat hai.\n"
+                    f"Membership expiry: {fmt_ist(expiry)}\n\n{note}"
+                ),
+            )
+        except Exception:
+            logger.exception("member approve DM failed")
+    elif not link_text:
+        try:
+            await context.bot.send_message(
+                chat_id=member_id,
+                text="Payment approve ho gayi, lekin join link banane me masla aaya hai. Admin se rabta karo.",
+            )
+        except Exception:
+            logger.exception("member approve DM failed")
 
 
 async def notify_group_admins(context, group, *, photo, caption, reply_markup):
@@ -1081,6 +1235,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     group = get_group_by_chat(req.chat.id)
     if not group:
         return  # Is bot ke liye register na kiye gaye groups ko touch na karein.
+    group = await sync_group_title(context.bot, group)
     if not group_is_active(group):
         try:
             await context.bot.decline_chat_join_request(req.chat.id, req.from_user.id)
@@ -1102,6 +1257,37 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         if approved:
             await context.bot.approve_chat_join_request(req.chat.id, req.from_user.id)
+            # Point 4+5: join-link wale DM ko 'safaltapurvak jud gaye' me badlo
+            # (taaki user dobara link na dabaye) + welcome aur validity DM me do.
+            member = get_member(group["id"], req.from_user.id)
+            expiry = parse_dt(member.get("expiry_date")) if member else None
+            joined_text = f"✅ Tum safaltapurvak {group['title']} me jud chuke ho!"
+            welcome = render_custom_welcome(group, req.from_user.first_name)
+            if welcome:
+                joined_text += f"\n\n{welcome}"
+            if expiry:
+                joined_text += f"\n\nMembership valid: {fmt_ist(expiry)}"
+            edited = False
+            invite_mid = (member or {}).get("invite_message_id")
+            if invite_mid:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=req.from_user.id, message_id=invite_mid, text=joined_text
+                    )
+                    edited = True
+                except Exception:
+                    edited = False
+                try:
+                    sb.table("members").update({"invite_message_id": None}).eq(
+                        "group_id", group["id"]
+                    ).eq("user_id", req.from_user.id).execute()
+                except Exception:
+                    pass
+            if not edited:
+                try:
+                    await context.bot.send_message(chat_id=req.from_user.id, text=joined_text)
+                except Exception:
+                    pass
         else:
             await context.bot.decline_chat_join_request(req.chat.id, req.from_user.id)
             await context.bot.send_message(
@@ -1130,48 +1316,76 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Group ko Supergroup me upgrade karke /setup dobara chalao."
         )
         return
+
+    # Point 2 (Clean Group): /setup wala message group se turant delete karo aur
+    # saari jaankari (registration + trial) admin ke personal DM me bhejo,
+    # taaki members ko group me kabhi setup/trial ka koi message na dikhe.
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    async def reply_admin(text: str):
+        try:
+            await context.bot.send_message(chat_id=user.id, text=text)
+            return
+        except Exception:
+            pass  # admin ne bot DM start nahi kiya — group me fallback (auto-delete ke saath)
+        try:
+            sent = await context.bot.send_message(chat_id=chat.id, text=text)
+            schedule_message_delete(context, chat.id, sent.message_id, delay=120)
+        except Exception:
+            pass
+
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
         if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-            await update.message.reply_text("Sirf group admin hi /setup kar sakta hai.")
+            await reply_admin("Sirf group admin hi /setup kar sakta hai.")
             return
         bot_member = await context.bot.get_chat_member(chat.id, context.bot.id)
         if bot_member.status != ChatMemberStatus.ADMINISTRATOR:
-            await update.message.reply_text(
+            await reply_admin(
                 "Pehle bot ko group admin banao. Gatekeeper ke liye Restrict members, "
                 "Delete messages aur Invite users permissions zaroori hain."
             )
             return
         if not getattr(bot_member, "can_restrict_members", False):
-            await update.message.reply_text(
+            await reply_admin(
                 "Bot admin hai, lekin Restrict members permission nahi hai. "
                 "Is permission ko enable karke /setup dobara chalao."
             )
             return
         if not getattr(bot_member, "can_delete_messages", False):
-            await update.message.reply_text(
+            await reply_admin(
                 "Bot ko Delete messages permission bhi do, taaki spam aur service messages hata sake."
             )
             return
         if not getattr(bot_member, "can_invite_users", False):
-            await update.message.reply_text(
+            await reply_admin(
                 "Bot ko Invite users permission bhi do, taaki paid join requests approve ho saken."
             )
             return
     except Exception:
-        await update.message.reply_text("Admin status check nahi ho saka. Bot ko group admin banao pehle.")
+        await reply_admin("Admin status check nahi ho saka. Bot ko group admin banao pehle.")
         return
 
     existing = get_group_by_chat(chat.id)
     if existing and group_is_active(existing):
-        await update.message.reply_text(
+        if chat.title and chat.title != existing.get("title"):
+            try:
+                sb.table("groups").update({"title": chat.title}).eq("id", existing["id"]).execute()
+                existing["title"] = chat.title
+            except Exception:
+                pass
+        await apply_member_chat_mode(context.bot, existing)
+        await reply_admin(
             f"Ye group pehle se registered hai: {existing['title']}\n"
             f"Members ke liye join link:\nhttps://t.me/{context.bot.username}?start=g{existing['id']}\n\n"
             "Settings ke liye bot ko DM me /admin likho."
         )
         return
     if existing and existing.get("owner_user_id") != user.id:
-        await update.message.reply_text(
+        await reply_admin(
             "Ye group kisi aur admin account se register hua tha. Purane registered owner "
             "ko /setup chalane ko kaho; ownership transfer ke liye platform support se rabta karo."
         )
@@ -1179,7 +1393,7 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     has_access, _, trial_until = admin_account_access(user.id)
     if not has_access:
-        await update.message.reply_text(
+        await reply_admin(
             "Tumhara SaaS trial khatm ho gaya hai. Naya group register karne ke liye "
             f"bot DM me /billing kholo (trial end: {fmt_ist(trial_until)})."
         )
@@ -1208,22 +1422,30 @@ async def setup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "gatekeeper_enabled": True,
                     "anti_spam_enabled": True,
                     "flood_control_enabled": True,
+                    "member_chat_enabled": False,
                     "is_active": True,
                 }
             ).execute()
             gid = res.data[0]["id"]
     except Exception:
         logger.exception("group insert failed")
-        await update.message.reply_text("Registration me masla aaya, dobara try karo.")
+        await reply_admin("Registration me masla aaya, dobara try karo.")
         return
 
     account = get_admin_account(user.id)
     if not account:
         logger.error("Admin trial could not be initialized for user %s", user.id)
 
-    await update.message.reply_text(
+    # Point 1: registration ke saath hi read-only (broadcast) mode default apply karo.
+    fresh_group = get_group_by_chat(chat.id)
+    if fresh_group:
+        await apply_member_chat_mode(context.bot, fresh_group)
+
+    await reply_admin(
         f"{'Purana group wapas active ho gaya' if existing else 'Group registered ho gaya'}: {chat.title}\n\n"
         f"Members ke liye join link:\nhttps://t.me/{context.bot.username}?start=g{gid}\n\n"
+        "Group abhi READ-ONLY mode me hai: members ko message box nahi dikhega, sirf Mute/Unmute button rahega. "
+        "Members ki chat kholni ho to dashboard me 'Member Chat' toggle ON kar do.\n\n"
         "Ab bot ko DM me /dashboard likh kar UPI ID/QR, plans, welcome, FAQ aur moderation set karo. "
         f"{'Purani group settings aur member history preserve hain.' if existing else 'Tumhara 7-day free trial ab shuru ho gaya hai.'}"
     )
@@ -1259,6 +1481,12 @@ def dashboard_markup(group: dict) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    f"Member Chat: {'ON' if group.get('member_chat_enabled', False) else 'OFF (Read-Only)'}",
+                    callback_data=f"adm:memberchat:{group_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     f"Link Blocker: {'ON' if links else 'OFF'}",
                     callback_data=f"adm:linkblock:{group_id}",
                 ),
@@ -1281,6 +1509,8 @@ def dashboard_markup(group: dict) -> InlineKeyboardMarkup:
 async def show_group_list(message_or_query, user_id: int, bot, groups=None):
     if groups is None:
         groups = await get_live_owned_groups(user_id, bot)
+    for g in groups:
+        await sync_group_title(bot, g)
     if not groups:
         text = (
             "Tumhara koi active group registered nahi hai.\n\n"
@@ -1334,7 +1564,9 @@ async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def show_dashboard(query, group: dict):
+async def show_dashboard(query, group: dict, bot=None):
+    if bot is not None:
+        group = await sync_group_title(bot, group)
     plans = get_plans(group)
     plan_lines = "\n".join(
         f"  {PLAN_NAMES[l]}: Rs {plans[l]['price']} ({plans[l]['days']} din)" for l in ("1m", "3m", "1yr")
@@ -1355,7 +1587,8 @@ async def show_dashboard(query, group: dict):
         f"Plans:\n{plan_lines}\n\n"
         f"Welcome message: {'custom' if group.get('welcome_message') else 'default'}\n"
         f"FAQ keywords: {len(group.get('faq_replies') or {})}\n"
-        f"Gatekeeper: {'ON' if group.get('gatekeeper_enabled', True) else 'OFF'}"
+        f"Gatekeeper: {'ON' if group.get('gatekeeper_enabled', True) else 'OFF'}\n"
+        f"Member Chat: {'ON' if group.get('member_chat_enabled', False) else 'OFF (Read-Only — sirf admins post kar sakte hain)'}"
     )
     await query.edit_message_text(
         text, reply_markup=dashboard_markup(group), parse_mode="Markdown"
@@ -1411,7 +1644,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return A_NAV
 
     if action == "grp":
-        await show_dashboard(query, group)
+        await show_dashboard(query, group, bot=context.bot)
         return A_NAV
 
     if action == "upi":
@@ -1471,7 +1704,29 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=dashboard_markup(group),
             )
             return A_NAV
-        await show_dashboard(query, group)
+        await show_dashboard(query, group, bot=context.bot)
+        return A_NAV
+
+    if action == "memberchat":
+        # Point 1 toggle: DB flag flip + Telegram par default permissions turant apply.
+        try:
+            new_value = not member_chat_enabled(group)
+            sb.table("groups").update({"member_chat_enabled": new_value}).eq("id", group_id).execute()
+            group["member_chat_enabled"] = new_value
+        except Exception:
+            logger.exception("member chat toggle save failed")
+            await query.edit_message_text(
+                "Setting save nahi hui. Supabase migration 000002 apply hui hai ya nahi check karo.",
+                reply_markup=dashboard_markup(group),
+            )
+            return A_NAV
+        if not await apply_member_chat_mode(context.bot, group):
+            await safe_answer(
+                query,
+                "Toggle save ho gaya, lekin Telegram permissions apply nahi hue. Bot ke admin rights check karke dobara try karo.",
+                alert=True,
+            )
+        await show_dashboard(query, group, bot=context.bot)
         return A_NAV
 
     if action == "welcome":
@@ -1822,8 +2077,12 @@ async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-async def gate_member(context, group: dict, member):
-    """Mute unentitled joins and show the private payment-process link."""
+async def gate_member(context, group: dict, member, *, joined: bool = False):
+    """Join/message par member ka access enforce karo.
+
+    Koi bhi notification group ke andar post nahi hogi — sab kuch sirf member ke
+    DM me jayega (clean group view). Group ke andar sirf admins bolenge jab
+    read-only mode on ho."""
     chat_id = group["chat_id"]
     user_id = member.id
     now_ts = now_utc().timestamp()
@@ -1838,63 +2097,78 @@ async def gate_member(context, group: dict, member):
     if user_id == group["owner_user_id"] or user_id in await get_admin_ids(context, chat_id):
         return
     active = member_is_active(group["id"], user_id)
-    if group.get("gatekeeper_enabled", True):
-        if active:
-            await unrestrict_if_joined(context, chat_id, user_id)
-        else:
-            try:
-                await context.bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    permissions=ChatPermissions.no_permissions(),
-                    use_independent_chat_permissions=True,
-                )
-            except Exception:
-                logger.exception("gatekeeper restriction failed for user %s", user_id)
-                try:
-                    await context.bot.send_message(
-                        chat_id=group["owner_user_id"],
-                        text=(
-                            f"Gatekeeper {group['title']} me user ko restrict nahi kar saka. "
-                            "Bot ko Supergroup admin bana kar Restrict members permission check karo."
-                        ),
-                    )
-                except Exception:
-                    pass
+    gatekeeper = group.get("gatekeeper_enabled", True)
 
-    template = group.get("welcome_message") or "Welcome {name} to {group}!"
-    greeting = template.replace("{name}", member.first_name or "Member").replace("{group}", group["title"])
-    if not active and group.get("gatekeeper_enabled", True):
-        greeting += "\n\nAccess paane ke liye payment aur verification process complete karo."
-        keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton(
-                    "🚀 Complete Process / Join VIP",
-                    url=f"https://t.me/{context.bot.username}?start=g{group['id']}",
-                )
-            ]]
-        )
+    async def restrict_user():
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=ChatPermissions.no_permissions(),
+                use_independent_chat_permissions=True,
+            )
+        except Exception:
+            logger.exception("member restriction failed for user %s", user_id)
+
+    if member_chat_enabled(group):
+        # Chat ON: paid members ko chat access milega, baaki gatekeeper par rahenge.
+        if gatekeeper:
+            if active:
+                await unrestrict_if_joined(context, chat_id, user_id)
+            else:
+                await restrict_user()
     else:
-        keyboard = None
+        # Read-only (broadcast) mode: admins ke alawa har member sirf sun sakta hai.
+        await restrict_user()
+
+    # Notifications — sirf DM me (points 2 aur 5).
     try:
-        welcome = await context.bot.send_message(chat_id, greeting, reply_markup=keyboard)
-        schedule_message_delete(context, chat_id, welcome.message_id, delay=120)
+        if active:
+            if joined:
+                member_row = get_member(group["id"], user_id)
+                welcome = render_custom_welcome(group, member.first_name) or (
+                    f"Welcome {member.first_name or 'Member'} to {group['title']}!"
+                )
+                if member_row and member_row.get("expiry_date"):
+                    welcome += f"\n\nMembership valid: {fmt_ist(member_row['expiry_date'])}"
+                await context.bot.send_message(chat_id=user_id, text=welcome)
+        elif gatekeeper:
+            keyboard = InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🚀 Complete Process / Join VIP",
+                        url=f"https://t.me/{context.bot.username}?start=g{group['id']}",
+                    )
+                ]]
+            )
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"{group['title']} ek paid group hai. Access paane ke liye "
+                    "payment aur verification process complete karo:"
+                ),
+                reply_markup=keyboard,
+            )
     except Exception:
-        logger.exception("welcome message failed for group %s", group["id"])
+        pass  # user ne bot start nahi kiya ho to DM fail hoga — koi baat nahi
 
 
 async def welcome_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg or not msg.new_chat_members:
         return
+    # Point 2: join wala service message group se turant hata do (clean view).
+    try:
+        await msg.delete()
+    except Exception:
+        schedule_message_delete(context, msg.chat_id, msg.message_id, delay=5)
     group = get_group_by_chat(msg.chat_id)
     if not group_is_active(group):
         return
     for member in msg.new_chat_members:
         if member.is_bot:
             continue
-        await gate_member(context, group, member)
-    schedule_message_delete(context, msg.chat_id, msg.message_id, delay=120)
+        await gate_member(context, group, member, joined=True)
 
 
 async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1916,7 +2190,7 @@ async def chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_member and not was_member and not new.user.is_bot:
         group = get_group_by_chat(member_update.chat.id)
         if group:
-            await gate_member(context, group, new.user)
+            await gate_member(context, group, new.user, joined=True)
 
 
 async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1961,6 +2235,24 @@ async def bot_chat_member_update(update: Update, context: ContextTypes.DEFAULT_T
 async def delete_service_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.effective_message.delete()
+    except Exception:
+        pass
+
+
+async def title_change_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Point 2+3: group ka naam badle to service message delete karo aur
+    naya title foran database me sync kar do."""
+    msg = update.effective_message
+    if not msg or not msg.new_chat_title:
+        return
+    group = get_group_by_chat(msg.chat_id)
+    if group and msg.new_chat_title != group.get("title"):
+        try:
+            sb.table("groups").update({"title": msg.new_chat_title}).eq("id", group["id"]).execute()
+        except Exception:
+            logger.exception("title change sync failed for group %s", group.get("id"))
+    try:
+        await msg.delete()
     except Exception:
         pass
 
@@ -2246,6 +2538,7 @@ def main():
 
     # Group moderation (status updates pehle, phir aam messages)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_member), group=0)
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_TITLE, title_change_handler), group=0)
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, delete_service_msg), group=0)
     app.add_handler(
         MessageHandler(
